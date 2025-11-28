@@ -74,6 +74,9 @@ func main() {
 	// Initialize handler with storage and session store
 	h := handler.NewHandler(gadgetClient, store, sessionStore)
 
+	// Register session ended callback to clean up state when sessions timeout
+	gadgetClient.SetSessionEndedCallback(h.CleanupSession)
+
 	// Setup router
 	r := mux.NewRouter()
 	h.RegisterRoutes(r)

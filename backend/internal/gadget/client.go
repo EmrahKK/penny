@@ -15,8 +15,9 @@ import (
 
 // Client manages gadget operations
 type Client struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
+	mu               sync.RWMutex
+	sessions         map[string]*Session
+	sessionEndedFunc func(sessionID string, reason string) // Callback when session ends
 }
 
 // Session represents an active gadget session
@@ -43,6 +44,11 @@ func NewClient() *Client {
 	return &Client{
 		sessions: make(map[string]*Session),
 	}
+}
+
+// SetSessionEndedCallback sets the callback function that's called when a session ends
+func (c *Client) SetSessionEndedCallback(fn func(sessionID string, reason string)) {
+	c.sessionEndedFunc = fn
 }
 
 // RunGadget starts a new gadget session
@@ -177,6 +183,10 @@ func (c *Client) RunGadget(ctx context.Context, req models.GadgetRequest, sessio
 			// Timeout reached, stop the gadget
 			fmt.Printf("Gadget session %s timed out after %v, stopping...\n", sessionID, session.Timeout)
 			c.StopGadget(sessionID)
+			// Notify cleanup handler
+			if c.sessionEndedFunc != nil {
+				c.sessionEndedFunc(sessionID, "timeout")
+			}
 		case <-cmdCtx.Done():
 			// Context cancelled before timeout
 			return
@@ -186,14 +196,18 @@ func (c *Client) RunGadget(ctx context.Context, req models.GadgetRequest, sessio
 	// Wait for command completion
 	go func() {
 		err := cmd.Wait()
+		reason := "completed"
 		if err != nil && cmdCtx.Err() == nil {
 			fmt.Printf("Gadget exited with error: %v\n", err)
 			session.ErrorCh <- fmt.Errorf("gadget exited with error: %w", err)
+			reason = "error"
 		} else if cmdCtx.Err() != nil {
 			if cmdCtx.Err() == context.DeadlineExceeded {
 				fmt.Printf("Gadget session %s timed out\n", sessionID)
+				reason = "timeout"
 			} else {
 				fmt.Printf("Gadget cancelled: %v\n", cmdCtx.Err())
+				reason = "cancelled"
 			}
 		} else {
 			fmt.Printf("Gadget exited normally\n")
@@ -201,6 +215,16 @@ func (c *Client) RunGadget(ctx context.Context, req models.GadgetRequest, sessio
 		session.Status = "stopped"
 		close(session.OutputCh)
 		close(session.ErrorCh)
+
+		// Notify cleanup handler when process exits
+		// Only if session still exists (not manually stopped)
+		c.mu.RLock()
+		_, exists := c.sessions[sessionID]
+		c.mu.RUnlock()
+
+		if exists && c.sessionEndedFunc != nil {
+			c.sessionEndedFunc(sessionID, reason)
+		}
 	}()
 
 	return session, nil

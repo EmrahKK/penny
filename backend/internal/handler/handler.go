@@ -183,11 +183,38 @@ func (h *Handler) StopSession(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
 
-	// Stop the gadget locally
-	if err := h.gadgetClient.StopGadget(sessionID); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to stop session: %v", err), http.StatusInternalServerError)
+	// Check if session exists in session store
+	var sessionExists bool
+	if h.sessionStore != nil {
+		session, err := h.sessionStore.GetSession(sessionID)
+		sessionExists = err == nil && session != nil
+	}
+
+	// Try to stop the gadget locally
+	err := h.gadgetClient.StopGadget(sessionID)
+	if err != nil {
+		// If session not found locally but exists in store, it may have already timed out
+		// Clean up the state and return success
+		if sessionExists {
+			log.Printf("Session %s not found locally (likely timed out), cleaning up state", sessionID)
+			h.CleanupSession(sessionID, "manual_stop")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// Session doesn't exist anywhere
+		http.Error(w, fmt.Sprintf("Session not found: %v", err), http.StatusNotFound)
 		return
 	}
+
+	// Session was stopped successfully, clean up state
+	h.CleanupSession(sessionID, "manual_stop")
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// CleanupSession cleans up session state when a session ends (timeout, manual stop, or error)
+func (h *Handler) CleanupSession(sessionID string, reason string) {
+	log.Printf("Cleaning up session %s (reason: %s)", sessionID, reason)
 
 	// Remove from distributed session store
 	if h.sessionStore != nil {
@@ -198,12 +225,34 @@ func (h *Handler) StopSession(w http.ResponseWriter, r *http.Request) {
 
 	// Record session end in storage (for historical data)
 	if h.storage != nil {
-		if err := h.storage.RecordSessionEnd(r.Context(), sessionID); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := h.storage.RecordSessionEnd(ctx, sessionID); err != nil {
 			log.Printf("Failed to record session end: %v", err)
 		}
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	// Close WebSocket connections for this session and notify clients
+	h.mu.Lock()
+	if client, exists := h.wsClients[sessionID]; exists {
+		message := map[string]interface{}{
+			"type":   "session_ended",
+			"reason": reason,
+		}
+		if data, err := json.Marshal(message); err == nil {
+			select {
+			case client.Send <- data:
+			default:
+				// Client send buffer full
+			}
+		}
+		close(client.Send)
+		delete(h.wsClients, sessionID)
+	}
+	h.mu.Unlock()
+
+	log.Printf("Session %s cleanup completed", sessionID)
 }
 
 // HandleWebSocket handles WebSocket connections for real-time gadget output
