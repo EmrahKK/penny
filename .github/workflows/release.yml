@@ -9,7 +9,6 @@ jobs:
   push:
     name: Docker Push
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
 
     env:
       REPOSITORY_URL: registry.hub.docker.com
@@ -22,13 +21,13 @@ jobs:
         id: docker-build-backend
         run: >-
           docker build
-          -t $REPOSITORY_URL/$IMAGE_NAME:$(cat VERSION)          
+          -t $REPOSITORY_URL/$IMAGE_NAME_BACKEND:$(cat VERSION)          
           -t $REPOSITORY_URL/$IMAGE_NAME_BACKEND:$(git rev-parse --short HEAD) ./backend
       - name: Build Frontend
         id: docker-build-frontend
         run: >-
           docker build
-          -t $REPOSITORY_URL/$IMAGE_NAME:$(cat VERSION)
+          -t $REPOSITORY_URL/$IMAGE_NAME_FRONTEND:$(cat VERSION)
           -t $REPOSITORY_URL/$IMAGE_NAME_FRONTEND:$(git rev-parse --short HEAD) ./frontend          
       - name: Docker Login
         uses: docker/login-action@v3
