@@ -4,6 +4,10 @@
 
 A modern, full-featured web interface for [Inspektor Gadget](https://github.com/inspektor-gadget/inspektor-gadget) that brings powerful eBPF-based observability tools to your Kubernetes clusters with real-time monitoring, historical analysis, and an intuitive user experience.
 
+
+![Penny Screen](/docs/ss01.png)
+
+
 ## Why PENNY?
 
 PENNY transforms complex eBPF-based observability into an accessible, visual experience:
