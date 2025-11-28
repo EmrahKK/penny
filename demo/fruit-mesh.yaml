@@ -1,0 +1,269 @@
+# -------------------
+# 1. Shared Python Application Logic
+# -------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shared-app-code
+data:
+  main.py: |
+    import os
+    import time
+    import threading
+    import json
+    import requests
+    from flask import Flask, request
+
+    app = Flask(__name__)
+
+    # Config yükle
+    # Format: {"targets": [{"url": "http://service-name", "interval": 60}]}
+    config_path = "/etc/config/settings.json"
+    
+    def load_config():
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        return {"targets": []}
+
+    @app.route('/')
+    def home():
+        return f"Hello from {os.environ.get('HOSTNAME')} ({os.environ.get('APP_NAME')})\n"
+
+    def background_caller():
+        config = load_config()
+        targets = config.get("targets", [])
+        
+        if not targets:
+            print("No targets configured.")
+            return
+
+        print(f"Starting background calls for: {targets}")
+        
+        # Her hedef için ayrı bir thread yerine basit bir döngü (demo amaçlı)
+        # Gerçek hayatta bu daha sofistike bir scheduler olmalı.
+        # Burada basitlik adına her target için ayrı thread açıyoruz.
+        for target in targets:
+            t = threading.Thread(target=run_schedule, args=(target,))
+            t.daemon = True
+            t.start()
+
+    def run_schedule(target_config):
+        url = target_config['url']
+        interval = target_config['interval']
+        while True:
+            try:
+                print(f"Calling {url}...")
+                response = requests.get(url, timeout=2)
+                print(f"Success: {url} - Status: {response.status_code}")
+            except Exception as e:
+                print(f"Error calling {url}: {e}")
+            time.sleep(interval)
+
+    if __name__ == "__main__":
+        # Arka plan işlerini başlat
+        threading.Thread(target=background_caller, daemon=True).start()
+        # Flask sunucusunu başlat
+        app.run(host='0.0.0.0', port=80)
+
+---
+# -------------------
+# 2. APPLES (Deployment & Config)
+# -------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apples-config
+data:
+  settings.json: |
+    {
+      "targets": [
+        {"url": "http://oranges", "interval": 60},
+        {"url": "http://bananas", "interval": 120}
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apples
+spec:
+  selector:
+    app: apples
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apples
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: apples
+  template:
+    metadata:
+      labels:
+        app: apples
+    spec:
+      containers:
+      - name: main
+        image: python:3.9-slim
+        # Curl, Flask ve Requests'i runtime'da kuruyoruz (Demo kolaylığı için)
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            apt-get update && apt-get install -y curl && \
+            pip install flask requests && \
+            python /app/main.py
+        env:
+        - name: APP_NAME
+          value: "apples"
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: app-config
+          mountPath: /etc/config
+      volumes:
+      - name: app-code
+        configMap:
+          name: shared-app-code
+      - name: app-config
+        configMap:
+          name: apples-config
+
+---
+# -------------------
+# 3. ORANGES (Deployment & Config)
+# -------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oranges-config
+data:
+  settings.json: |
+    {
+      "targets": [
+        {"url": "http://bananas", "interval": 60}
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oranges
+spec:
+  selector:
+    app: oranges
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oranges
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: oranges
+  template:
+    metadata:
+      labels:
+        app: oranges
+    spec:
+      containers:
+      - name: main
+        image: python:3.9-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            apt-get update && apt-get install -y curl && \
+            pip install flask requests && \
+            python /app/main.py
+        env:
+        - name: APP_NAME
+          value: "oranges"
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: app-config
+          mountPath: /etc/config
+      volumes:
+      - name: app-code
+        configMap:
+          name: shared-app-code
+      - name: app-config
+        configMap:
+          name: oranges-config
+
+---
+# -------------------
+# 4. BANANAS (StatefulSet & Config)
+# -------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bananas-config
+data:
+  settings.json: |
+    {
+      "targets": [
+        {"url": "http://apples", "interval": 180}
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bananas
+spec:
+  selector:
+    app: bananas
+  ports:
+    - port: 80
+      targetPort: 80
+  clusterIP: None # Headless Service (StatefulSet için önerilir ama zorunlu değil, burada DNS için iyi olur)
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bananas
+spec:
+  serviceName: "bananas"
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bananas
+  template:
+    metadata:
+      labels:
+        app: bananas
+    spec:
+      containers:
+      - name: main
+        image: python:3.9-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            apt-get update && apt-get install -y curl && \
+            pip install flask requests && \
+            python /app/main.py
+        env:
+        - name: APP_NAME
+          value: "bananas"
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: app-config
+          mountPath: /etc/config
+      volumes:
+      - name: app-code
+        configMap:
+          name: shared-app-code
+      - name: app-config
+        configMap:
+          name: bananas-config

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oranges
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: oranges
+  template:
+    metadata:
+      labels:
+        app: oranges
+    spec:
+      containers:
+      - name: oranges
+        image: demo-service:latest
+        imagePullPolicy: Never
+        env:
+        - name: SERVICE_NAME
+          value: "oranges"
+        - name: TARGETS
+          value: "bananas:8080"
+        - name: INTERVALS
+          value: "60"  # Call bananas every 60s
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oranges
+  namespace: demo
+spec:
+  selector:
+    app: oranges
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP

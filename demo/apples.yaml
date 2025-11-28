@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apples
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: apples
+  template:
+    metadata:
+      labels:
+        app: apples
+    spec:
+      containers:
+      - name: apples
+        image: demo-service:latest
+        imagePullPolicy: Never
+        env:
+        - name: SERVICE_NAME
+          value: "apples"
+        - name: TARGETS
+          value: "oranges:8080,bananas:8080"
+        - name: INTERVALS
+          value: "60,120"  # Call oranges every 60s, bananas every 120s
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apples
+  namespace: demo
+spec:
+  selector:
+    app: apples
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: penny-backend
+  namespace: penny
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: penny-backend-role
+rules:
+  # Permissions needed to run kubectl-gadget
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/portforward", "pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gadget.kinvolk.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["gadget.inspektor-gadget.io"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: penny-backend-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: penny-backend-role
+subjects:
+  - kind: ServiceAccount
+    name: penny-backend
+    namespace: penny

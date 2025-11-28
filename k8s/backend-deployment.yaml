@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: penny
+  labels:
+    app: penny-backend
+spec:
+  # Phase 2: With distributed session management, you can now scale horizontally
+  # Example: kubectl scale deployment backend -n penny --replicas=3
+  replicas: 1
+  selector:
+    matchLabels:
+      app: penny-backend
+  template:
+    metadata:
+      labels:
+        app: penny-backend
+    spec:
+      serviceAccountName: penny-backend
+      containers:
+        - name: backend
+          image: emrahkk/penny-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            # Redis for session store and event streaming
+            - name: REDIS_ADDR
+              value: "redis:6379"
+            - name: REDIS_PASSWORD
+              value: ""
+            # TimescaleDB for historical data
+            - name: POSTGRES_URL
+              value: "postgres://gadget:gadget_password_change_in_production@timescaledb:5432/gadget_events"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: penny
+  labels:
+    app: penny-backend
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: penny-backend

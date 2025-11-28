@@ -1,0 +1,197 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: timescaledb-secret
+  namespace: penny
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "gadget_password_change_in_production"
+  POSTGRES_USER: "gadget"
+  POSTGRES_DB: "gadget_events"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: timescaledb-data
+  namespace: penny
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: timescaledb
+  namespace: penny
+  labels:
+    app: timescaledb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: timescaledb
+  template:
+    metadata:
+      labels:
+        app: timescaledb
+    spec:
+      containers:
+      - name: timescaledb
+        image: timescale/timescaledb:latest-pg16
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_DB
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+          subPath: postgres
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - gadget
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - gadget
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: timescaledb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: timescaledb
+  namespace: penny
+  labels:
+    app: timescaledb
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgres
+  selector:
+    app: timescaledb
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: timescaledb-init
+  namespace: penny
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: init-db
+        image: timescale/timescaledb:latest-pg16
+        env:
+        - name: PGHOST
+          value: "timescaledb"
+        - name: PGPORT
+          value: "5432"
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: timescaledb-secret
+              key: POSTGRES_DB
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Wait for TimescaleDB to be ready
+          until pg_isready -h $PGHOST -p $PGPORT -U $PGUSER; do
+            echo "Waiting for TimescaleDB..."
+            sleep 2
+          done
+
+          # Create schema
+          # Enable TimescaleDB extension
+          psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
+          # Create events table
+          psql -v ON_ERROR_STOP=1 -c "
+            CREATE TABLE IF NOT EXISTS gadget_events (
+              time TIMESTAMPTZ NOT NULL,
+              session_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              namespace TEXT,
+              pod_name TEXT,
+              data JSONB NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT NOW()
+            );"
+
+          # Convert to hypertable
+          psql -v ON_ERROR_STOP=1 -c "SELECT create_hypertable('gadget_events', 'time', if_not_exists => TRUE);"
+
+          # Create indexes
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_events_session_id ON gadget_events (session_id, time DESC);"
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_events_type_time ON gadget_events (event_type, time DESC);"
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_events_namespace ON gadget_events (namespace, time DESC);"
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_events_data ON gadget_events USING GIN (data);"
+
+          # Create sessions table
+          psql -v ON_ERROR_STOP=1 -c "
+            CREATE TABLE IF NOT EXISTS gadget_sessions (
+              id TEXT PRIMARY KEY,
+              type TEXT NOT NULL,
+              namespace TEXT,
+              pod_name TEXT,
+              status TEXT NOT NULL,
+              start_time TIMESTAMPTZ NOT NULL,
+              end_time TIMESTAMPTZ,
+              event_count BIGINT DEFAULT 0,
+              created_at TIMESTAMPTZ DEFAULT NOW(),
+              updated_at TIMESTAMPTZ DEFAULT NOW()
+            );"
+
+          # Create indexes on sessions
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON gadget_sessions (start_time DESC);"
+          psql -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_sessions_type ON gadget_sessions (type);"
+
+          echo "Database initialized successfully!"

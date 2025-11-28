@@ -1,0 +1,46 @@
+name: Push to DockerHub
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+
+  push:
+    name: Docker Push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    env:
+      REPOSITORY_URL: registry.hub.docker.com
+      IMAGE_NAME_BACKEND: emrahkk/penny-backend
+      IMAGE_NAME_FRONTEND: emrahkk/penny-frontend
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Backend
+        id: docker-build-backend
+        run: >-
+          docker build
+          -t $REPOSITORY_URL/$IMAGE_NAME:$(cat VERSION)          
+          -t $REPOSITORY_URL/$IMAGE_NAME_BACKEND:$(git rev-parse --short HEAD) ./backend
+      - name: Build Frontend
+        id: docker-build-frontend
+        run: >-
+          docker build
+          -t $REPOSITORY_URL/$IMAGE_NAME:$(cat VERSION)
+          -t $REPOSITORY_URL/$IMAGE_NAME_FRONTEND:$(git rev-parse --short HEAD) ./frontend          
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REPOSITORY_URL }}
+          username: emrahkk
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish Image Backend
+        id: docker-push-backend
+        run: docker push --all-tags $REPOSITORY_URL/$IMAGE_NAME_BACKEND
+      - name: Publish Image Frontend
+        id: docker-push-frontend
+        run: docker push --all-tags $REPOSITORY_URL/$IMAGE_NAME_FRONTEND        
+
+

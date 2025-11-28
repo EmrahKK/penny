@@ -1,0 +1,29 @@
+# Optional: Ingress for production use
+# Requires an Ingress Controller to be installed (e.g., nginx-ingress, traefik)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: penny
+  namespace: penny
+  annotations:
+    # Remove global rewrite-target to preserve paths
+    traefik.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    traefik.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Session affinity for sticky sessions
+    traefik.ingress.kubernetes.io/affinity: "true"
+    traefik.ingress.kubernetes.io/session-cookie-name: "backend-session"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: penny.lima.local  # Change this to your domain
+      http:
+        paths:
+          # Route everything to frontend - frontend nginx will proxy to backend
+          # This preserves the existing architecture while enabling sticky sessions
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
