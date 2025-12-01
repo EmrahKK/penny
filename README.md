@@ -4,8 +4,20 @@
 
 A modern, full-featured web interface for [Inspektor Gadget](https://github.com/inspektor-gadget/inspektor-gadget) that brings powerful eBPF-based observability tools to your Kubernetes clusters with real-time monitoring, historical analysis, and an intuitive user experience.
 
+![Penny Screen](/docs/gadgets_catalog_menu.png)
+Gadgets Catalog Menu
 
-![Penny Screen](/docs/ss01.png)
+![Penny Screen](/docs/gadget_catalog.png)
+Gadget Catalog
+
+![Penny Screen](/docs/tcp_trace_flow.png)
+TCP flow Map
+
+![Penny Screen](/docs/tcp_trace_summary.png)
+TCP Connaection Summary
+
+![Penny Screen](/docs/active_sesions.png)
+Active Session List
 
 
 ## Why PENNY?
