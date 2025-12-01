@@ -1,35 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react';
+import * as d3 from 'd3';
 import { GadgetOutput } from '../types';
 
-interface Node {
+interface Node extends d3.SimulationNodeDatum {
   id: string;
   label: string;
   type: 'pod' | 'service' | 'external';
-  namespace?: string; // Kubernetes namespace
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  radius: number;
-  color: string;
+  namespace?: string;
   connections: number;
-  podCount?: number; // For grouped pod nodes
-  pods?: Set<string>; // Track individual pod names in the group
+  podCount?: number;
+  pods?: Set<string>;
 }
 
-interface Connection {
-  from: Node;
-  to: Node;
+interface Link extends d3.SimulationLinkDatum<Node> {
+  source: Node;
+  target: Node;
   count: number;
   errorCount: number;
-  lastSeen: number;
-  particles: Particle[];
-  eventType: string; // 'accept' or 'connect'
-}
-
-interface Particle {
-  progress: number;
-  speed: number;
+  eventType: string;
 }
 
 interface Props {
@@ -37,50 +25,19 @@ interface Props {
 }
 
 export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [nodes, setNodes] = useState<Map<string, Node>>(new Map());
-  const [connections, setConnections] = useState<Map<string, Connection>>(new Map());
+  const [links, setLinks] = useState<Map<string, Link>>(new Map());
   const [stats, setStats] = useState({ nodes: 0, connections: 0, flows: 0, errors: 0 });
-  const animationFrameRef = useRef<number>();
-  const [showLabels, setShowLabels] = useState(true);
-  const [isPaused, setIsPaused] = useState(false);
   const [showErrorsOnly, setShowErrorsOnly] = useState(false);
-  const [draggedNode, setDraggedNode] = useState<Node | null>(null);
-  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [zoom, setZoom] = useState(1.0); // Zoom level: 0.5 to 2.0
-  const [pan, setPan] = useState({ x: 0, y: 0 }); // Pan offset
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1.0);
   const [availableNamespaces, setAvailableNamespaces] = useState<Set<string>>(new Set());
   const [selectedNamespaces, setSelectedNamespaces] = useState<Set<string>>(new Set());
-
-  // Load saved positions from localStorage
-  const loadSavedPositions = (): Map<string, { x: number; y: number }> => {
-    try {
-      const saved = localStorage.getItem('tcpflow-node-positions');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return new Map(Object.entries(parsed));
-      }
-    } catch (e) {
-      console.error('Failed to load saved positions:', e);
-    }
-    return new Map();
-  };
-
-  const savedPositionsRef = useRef<Map<string, { x: number; y: number }>>(loadSavedPositions());
-
-  // Save positions to localStorage when nodes are dragged
-  const saveNodePosition = (nodeId: string, x: number, y: number) => {
-    savedPositionsRef.current.set(nodeId, { x, y });
-    try {
-      const positionsObj = Object.fromEntries(savedPositionsRef.current);
-      localStorage.setItem('tcpflow-node-positions', JSON.stringify(positionsObj));
-    } catch (e) {
-      console.error('Failed to save positions:', e);
-    }
-  };
+  const [liveUpdateEnabled, setLiveUpdateEnabled] = useState(true);
+  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
+  const simulationRef = useRef<d3.Simulation<Node, Link> | null>(null);
+  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
   // Node colors by type
   const nodeColors = {
@@ -101,7 +58,7 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       ip: typeof data.src === 'object' ? (data.src.addr || 'unknown') : (data.src || 'unknown'),
       port: typeof data.src === 'object' ? String(data.src.port || 0) : '0',
       eventType,
-      owner: data.k8s?.owner || null, // Extract owner (Deployment, StatefulSet, etc.)
+      owner: data.k8s?.owner || null,
     };
 
     // Extract destination info with Kubernetes service/pod name if available
@@ -113,9 +70,7 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       const dstK8s = data.dst.k8s;
       const dstPort = data.dst.port || 0;
 
-      // Check if it's a valid Kubernetes resource (not raw or empty)
       if (dstK8s.kind === 'svc' && dstK8s.name) {
-        // Service destination - for accept events, don't include ephemeral port
         if (isAcceptEvent) {
           dstLabel = `${dstK8s.name}.${dstK8s.namespace}.svc`;
         } else {
@@ -123,7 +78,6 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
         }
         dstType = 'service';
       } else if (dstK8s.kind === 'pod' && dstK8s.name) {
-        // Pod destination (headless service) - for accept events, don't include ephemeral port
         if (isAcceptEvent) {
           dstLabel = `${dstK8s.name}.${dstK8s.namespace}.pod`;
         } else {
@@ -131,10 +85,8 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
         }
         dstType = 'pod';
       } else if (dstK8s.kind === 'raw' || !dstK8s.name) {
-        // Raw/external destination - fall through to IP:port handling
         dstLabel = '';
       } else {
-        // Other Kubernetes resource with name - for accept events, don't include ephemeral port
         if (isAcceptEvent) {
           dstLabel = `${dstK8s.name}.${dstK8s.namespace}`;
         } else {
@@ -149,17 +101,14 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       const dstIp = typeof data.dst === 'object' ? (data.dst.addr || 'unknown') : (data.dst || 'unknown');
       const dstPort = typeof data.dst === 'object' ? String(data.dst.port || 0) : '0';
 
-      // For accept events, don't include ephemeral port in the label
       if (isAcceptEvent) {
         dstLabel = dstIp;
       } else {
         dstLabel = `${dstIp}:${dstPort}`;
       }
 
-      // Check if it's a raw kind (external IP)
       const isRaw = typeof data.dst === 'object' && data.dst.k8s && data.dst.k8s.kind === 'raw';
 
-      // Determine type: raw is always external, otherwise check IP range
       if (isRaw) {
         dstType = 'external';
       } else if (dstIp.startsWith('10.') || dstIp.startsWith('172.')) {
@@ -177,7 +126,7 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
     return { srcInfo, dstInfo };
   };
 
-  // Create or get node with smart hierarchical layout
+  // Create or get node
   const getOrCreateNode = (
     id: string,
     label: string,
@@ -189,56 +138,11 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       return nodesMap.get(id)!;
     }
 
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      throw new Error('Canvas not ready');
-    }
-
-    let x: number;
-    let y: number;
-
-    // Check if we have a saved position for this node
-    const savedPos = savedPositionsRef.current.get(id);
-    if (savedPos) {
-      x = savedPos.x;
-      y = savedPos.y;
-    } else {
-      // Smart hierarchical layout: pods on left, services/external on right
-      const padding = 100;
-      const verticalSpacing = 80;
-
-      if (type === 'pod') {
-        // Count existing pod nodes to stack vertically
-        const podCount = Array.from(nodesMap.values()).filter(n => n.type === 'pod').length;
-        x = padding + 50; // Left side
-        y = padding + (podCount * verticalSpacing);
-      } else if (type === 'service') {
-        // Count existing service nodes
-        const serviceCount = Array.from(nodesMap.values()).filter(n => n.type === 'service').length;
-        x = canvas.width - padding - 50; // Right side
-        y = padding + (serviceCount * verticalSpacing);
-      } else {
-        // External IPs - far right
-        const externalCount = Array.from(nodesMap.values()).filter(n => n.type === 'external').length;
-        x = canvas.width - padding - 150;
-        y = padding + (externalCount * verticalSpacing);
-      }
-
-      // Keep nodes within canvas bounds
-      y = Math.min(y, canvas.height - padding);
-    }
-
     const node: Node = {
       id,
       label,
       type,
       namespace,
-      x,
-      y,
-      vx: 0,
-      vy: 0,
-      radius: type === 'pod' ? 25 : 20,
-      color: nodeColors[type],
       connections: 0,
     };
 
@@ -250,9 +154,11 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
   useEffect(() => {
     if (outputs.length === 0) return;
 
+    // Skip updates if live update is disabled
+    if (!liveUpdateEnabled) return;
+
     const newNodes = new Map(nodes);
-    const newConnections = new Map(connections);
-    const now = Date.now();
+    const newLinks = new Map(links);
     const namespaces = new Set<string>();
 
     // Process last N events to build current state
@@ -262,7 +168,7 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       try {
         const { srcInfo, dstInfo } = parseEvent(output);
 
-        // Skip close events - they don't represent active traffic flows
+        // Skip close events
         if (srcInfo.eventType === 'close') {
           return;
         }
@@ -274,22 +180,19 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
 
         // Apply namespace filter if any namespaces are selected
         if (selectedNamespaces.size > 0 && !selectedNamespaces.has(srcInfo.namespace)) {
-          return; // Skip events from non-selected namespaces
+          return;
         }
 
         const hasError = output.data.error && output.data.error !== 0;
 
-        // Create source node grouped by k8s.owner (Deployment, StatefulSet, etc.)
+        // Create source node grouped by k8s.owner
         let srcId: string;
         if (srcInfo.owner && srcInfo.owner.name && srcInfo.owner.kind) {
-          // Group by owner workload
           srcId = `workload:${srcInfo.namespace}/${srcInfo.owner.kind}/${srcInfo.owner.name}`;
         } else {
-          // Fallback to individual pod if no owner info
           srcId = `pod:${srcInfo.namespace}/${srcInfo.pod}`;
         }
 
-        // Create node with temporary label (will be updated after pod count)
         const srcNode = getOrCreateNode(srcId, '', 'pod', newNodes, srcInfo.namespace);
 
         // Track individual pod in the group
@@ -299,51 +202,39 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
         srcNode.pods.add(srcInfo.pod);
         srcNode.podCount = srcNode.pods.size;
 
-        // Update label with 2 lines: name + kind, namespace
+        // Update label
         if (srcInfo.owner && srcInfo.owner.name && srcInfo.owner.kind) {
           srcNode.label = `${srcInfo.owner.name} ${srcInfo.owner.kind}\n${srcInfo.namespace}`;
         } else {
           srcNode.label = `${srcInfo.pod}\n${srcInfo.namespace}`;
         }
 
-        // Create destination node (service/pod/external)
+        // Create destination node
         const dstId = `dst:${dstInfo.label}`;
         const dstNode = getOrCreateNode(dstId, dstInfo.label, dstInfo.type, newNodes);
 
-        // For accept events, reverse the flow direction (dst -> src)
-        // For connect events, keep normal direction (src -> dst)
+        // For accept events, reverse the flow direction
         const isAccept = srcInfo.eventType === 'accept';
         const fromNode = isAccept ? dstNode : srcNode;
         const toNode = isAccept ? srcNode : dstNode;
-        const connId = `${fromNode.id}->${toNode.id}`;
+        const linkId = `${fromNode.id}->${toNode.id}`;
 
-        // Create or update connection
-        if (newConnections.has(connId)) {
-          const conn = newConnections.get(connId)!;
-          conn.count++;
+        // Create or update link
+        if (newLinks.has(linkId)) {
+          const link = newLinks.get(linkId)!;
+          link.count++;
           if (hasError) {
-            conn.errorCount++;
+            link.errorCount++;
           }
-          conn.lastSeen = now;
         } else {
           srcNode.connections++;
           dstNode.connections++;
 
-          const particles: Particle[] = [];
-          for (let i = 0; i < 3; i++) {
-            particles.push({
-              progress: i / 3,
-              speed: 0.005,
-            });
-          }
-
-          newConnections.set(connId, {
-            from: fromNode,
-            to: toNode,
+          newLinks.set(linkId, {
+            source: fromNode,
+            target: toNode,
             count: 1,
             errorCount: hasError ? 1 : 0,
-            lastSeen: now,
-            particles,
             eventType: srcInfo.eventType,
           });
         }
@@ -352,423 +243,395 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       }
     });
 
-    // Remove old connections (not seen in last 10 minutes)
-    // This keeps historical connections visible for a longer period
-    newConnections.forEach((conn, key) => {
-      if (now - conn.lastSeen > 600000) {
-        newConnections.delete(key);
-      }
-    });
-
     setNodes(newNodes);
-    setConnections(newConnections);
+    setLinks(newLinks);
     setAvailableNamespaces(namespaces);
 
-    const totalErrors = Array.from(newConnections.values()).reduce((sum, c) => sum + c.errorCount, 0);
+    const totalErrors = Array.from(newLinks.values()).reduce((sum, l) => sum + l.errorCount, 0);
 
     setStats({
       nodes: newNodes.size,
-      connections: newConnections.size,
-      flows: Array.from(newConnections.values()).reduce((sum, c) => sum + c.particles.length, 0),
+      connections: newLinks.size,
+      flows: newLinks.size,
       errors: totalErrors,
     });
-  }, [outputs, selectedNamespaces]);
+  }, [outputs, selectedNamespaces, liveUpdateEnabled]);
 
-  // Draw node
-  const drawNode = (ctx: CanvasRenderingContext2D, node: Node) => {
+  // D3 force simulation and rendering
+  useEffect(() => {
+    if (!svgRef.current || nodes.size === 0) return;
+
+    const svg = d3.select(svgRef.current);
+    const width = svgRef.current.clientWidth;
+    const height = svgRef.current.clientHeight;
+
+    // Clear previous content
+    svg.selectAll('*').remove();
+
     const isDark = document.documentElement.classList.contains('dark');
 
-    // Draw glow
-    ctx.shadowBlur = 10;
-    ctx.shadowColor = node.color;
+    // Create container group for zoom/pan
+    const container = svg.append('g');
 
-    // Special rendering for grouped pod nodes (similar to Redis cluster)
-    if (node.type === 'pod' && node.podCount && node.podCount > 1) {
-      // Draw cluster background with dashed border
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, node.radius + 5, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(76, 175, 80, 0.2)';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(76, 175, 80, 0.5)';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 5]);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    // Define arrow markers
+    const defs = svg.append('defs');
 
-      // Draw multiple smaller circles to represent pods in the group
-      const maxPods = Math.min(node.podCount, 6); // Show max 6 pods visually
-      const miniNodes = [];
+    // Arrow for normal flows (green)
+    defs
+      .append('marker')
+      .attr('id', 'arrow-normal')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 15)
+      .attr('refY', 0)
+      .attr('markerWidth', 8)
+      .attr('markerHeight', 8)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('fill', '#4CAF50')
+      .attr('d', 'M0,-5L10,0L0,5');
 
-      if (maxPods === 1) {
-        miniNodes.push({ angle: 0, offset: 0 });
-      } else {
-        for (let i = 0; i < maxPods; i++) {
-          miniNodes.push({
-            angle: (i * 360) / maxPods,
-            offset: 12,
-          });
+    // Arrow for accept flows (purple)
+    defs
+      .append('marker')
+      .attr('id', 'arrow-accept')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 15)
+      .attr('refY', 0)
+      .attr('markerWidth', 8)
+      .attr('markerHeight', 8)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('fill', '#9C27B0')
+      .attr('d', 'M0,-5L10,0L0,5');
+
+    // Arrow for error flows (red)
+    defs
+      .append('marker')
+      .attr('id', 'arrow-error')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 15)
+      .attr('refY', 0)
+      .attr('markerWidth', 8)
+      .attr('markerHeight', 8)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('fill', '#ff5252')
+      .attr('d', 'M0,-5L10,0L0,5');
+
+    const nodesArray = Array.from(nodes.values());
+    const linksArray = Array.from(links.values());
+
+    // Create force simulation with parameters similar to disjoint graph
+    const simulation = d3
+      .forceSimulation<Node>(nodesArray)
+      .force(
+        'link',
+        d3
+          .forceLink<Node, Link>(linksArray)
+          .id((d) => d.id)
+          .distance(150)
+          .strength(0.5)
+      )
+      .force('charge', d3.forceManyBody().strength(-1000))
+      .force('x', d3.forceX(width / 2).strength(0.03))
+      .force('y', d3.forceY(height / 2).strength(0.03))
+      .force('collide', d3.forceCollide().radius(60).strength(0.8));
+
+    simulationRef.current = simulation;
+
+    // Create links with consistent styling (straight lines)
+    const link = container
+      .append('g')
+      .attr('class', 'links')
+      .selectAll('line')
+      .data(linksArray)
+      .join('line')
+      .attr('stroke-width', 2)
+      .attr('stroke', (d) => {
+        if (d.errorCount > 0) {
+          return showErrorsOnly ? '#ff5252' : isDark ? 'rgba(255, 82, 82, 0.7)' : 'rgba(255, 82, 82, 0.6)';
         }
+        if (showErrorsOnly) {
+          return isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+        }
+        const isAccept = d.eventType === 'accept';
+        return isAccept
+          ? isDark ? 'rgba(156, 39, 176, 0.7)' : 'rgba(156, 39, 176, 0.6)'
+          : isDark ? 'rgba(76, 175, 80, 0.7)' : 'rgba(76, 175, 80, 0.6)';
+      })
+      .attr('stroke-opacity', 0.6)
+      .attr('marker-end', (d) => {
+        if (d.errorCount > 0) return 'url(#arrow-error)';
+        const isAccept = d.eventType === 'accept';
+        return isAccept ? 'url(#arrow-accept)' : 'url(#arrow-normal)';
+      })
+      .attr('class', 'link');
+
+    // Create link labels
+    const linkLabels = container
+      .append('g')
+      .attr('class', 'link-labels')
+      .selectAll('text')
+      .data(linksArray)
+      .join('text')
+      .attr('font-size', 11)
+      .attr('font-weight', 'bold')
+      .attr('text-anchor', 'middle')
+      .attr('fill', (d) => (d.errorCount > 0 ? '#ff5252' : isDark ? '#fff' : '#000'))
+      .attr('opacity', 0.8)
+      .attr('class', 'link-label')
+      .text((d) => (d.errorCount > 0 ? `${d.count} flows (${d.errorCount} errors)` : `${d.count} flows`));
+
+    // Create nodes
+    const node = container
+      .append('g')
+      .attr('class', 'nodes')
+      .selectAll<SVGGElement, Node>('g')
+      .data(nodesArray)
+      .join('g')
+      .attr('class', 'node')
+      .style('cursor', 'pointer')
+      .on('click', function (_event, d) {
+        setSelectedNode(d);
+      })
+      .on('mouseover', function (_event, d) {
+        // Highlight this node
+        d3.select(this).select('circle').attr('stroke-width', 3);
+
+        // Dim all links and labels
+        container.selectAll('.link').attr('stroke-opacity', 0.1);
+        container.selectAll('.link-label').attr('opacity', 0.1);
+
+        // Highlight connected links and their labels
+        container.selectAll('.link').each(function (linkData: any) {
+          const link = linkData as Link;
+          if (link.source.id === d.id || link.target.id === d.id) {
+            d3.select(this).attr('stroke-opacity', 1);
+          }
+        });
+
+        container.selectAll('.link-label').each(function (linkData: any) {
+          const link = linkData as Link;
+          if (link.source.id === d.id || link.target.id === d.id) {
+            d3.select(this).attr('opacity', 1);
+          }
+        });
+
+        // Dim unconnected nodes
+        container.selectAll('.node').attr('opacity', 0.2);
+
+        // Highlight connected nodes and this node
+        d3.select(this).attr('opacity', 1);
+        container.selectAll('.node').each(function (nodeData: any) {
+          const node = nodeData as Node;
+          const isConnected = linksArray.some(
+            (link) =>
+              (link.source.id === d.id && link.target.id === node.id) ||
+              (link.target.id === d.id && link.source.id === node.id)
+          );
+          if (isConnected) {
+            d3.select(this).attr('opacity', 1);
+          }
+        });
+      })
+      .on('mouseout', function () {
+        // Reset all styles
+        d3.select(this).select('circle').attr('stroke-width', 2);
+        container.selectAll('.link').attr('stroke-opacity', 0.6);
+        container.selectAll('.link-label').attr('opacity', 0.8);
+        container.selectAll('.node').attr('opacity', 1);
+      })
+      .call(
+        d3
+          .drag<SVGGElement, Node>()
+          .on('start', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          })
+          .on('drag', (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+          })
+          .on('end', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+          })
+      );
+
+    // Draw nodes with special rendering for grouped pods
+    node.each(function (d) {
+      const g = d3.select(this);
+
+      if (d.type === 'pod' && d.podCount && d.podCount > 1) {
+        // Draw cluster background
+        g.append('circle')
+          .attr('r', 30)
+          .attr('fill', 'rgba(76, 175, 80, 0.2)')
+          .attr('stroke', 'rgba(76, 175, 80, 0.5)')
+          .attr('stroke-width', 2)
+          .attr('stroke-dasharray', '5,5');
+
+        // Draw mini nodes
+        const maxPods = Math.min(d.podCount, 6);
+        const miniNodes = [];
+
+        if (maxPods === 1) {
+          miniNodes.push({ angle: 0, offset: 0 });
+        } else {
+          for (let i = 0; i < maxPods; i++) {
+            miniNodes.push({
+              angle: (i * 360) / maxPods,
+              offset: 12,
+            });
+          }
+        }
+
+        miniNodes.forEach((mini) => {
+          const rad = (mini.angle * Math.PI) / 180;
+          g.append('circle')
+            .attr('cx', Math.cos(rad) * mini.offset)
+            .attr('cy', Math.sin(rad) * mini.offset)
+            .attr('r', 8)
+            .attr('fill', nodeColors[d.type])
+            .attr('stroke', isDark ? '#fff' : '#000')
+            .attr('stroke-width', 1.5);
+        });
+      } else {
+        // Regular node
+        g.append('circle')
+          .attr('r', d.type === 'pod' ? 25 : 20)
+          .attr('fill', nodeColors[d.type])
+          .attr('stroke', isDark ? '#fff' : '#000')
+          .attr('stroke-width', 2);
       }
 
-      miniNodes.forEach((mini) => {
-        const rad = (mini.angle * Math.PI) / 180;
-        const mx = node.x + Math.cos(rad) * mini.offset;
-        const my = node.y + Math.sin(rad) * mini.offset;
+      // Connection count badge
+      if (d.connections > 0) {
+        const radius = d.type === 'pod' ? 25 : 20;
+        g.append('circle')
+          .attr('cx', radius - 5)
+          .attr('cy', -radius + 5)
+          .attr('r', 8)
+          .attr('fill', isDark ? '#fff' : '#000');
 
-        ctx.beginPath();
-        ctx.arc(mx, my, 8, 0, Math.PI * 2);
-        ctx.fillStyle = node.color;
-        ctx.fill();
-        ctx.strokeStyle = isDark ? '#fff' : '#000';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      });
-    } else {
-      // Draw regular node circle
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
-      ctx.fillStyle = node.color;
-      ctx.fill();
-      ctx.strokeStyle = isDark ? '#fff' : '#000';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
+        g.append('text')
+          .attr('x', radius - 5)
+          .attr('y', -radius + 5)
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'central')
+          .attr('font-size', 10)
+          .attr('font-weight', 'bold')
+          .attr('fill', isDark ? '#000' : '#fff')
+          .text(d.connections);
+      }
+    });
 
-    ctx.shadowBlur = 0;
+    // Add node labels
+    const labels = node
+      .append('text')
+      .attr('text-anchor', 'middle')
+      .attr('y', (d) => (d.type === 'pod' ? 40 : 35))
+      .attr('fill', isDark ? '#fff' : '#000')
+      .attr('font-size', 12);
 
-    // Draw connection count badge
-    if (node.connections > 0) {
-      ctx.beginPath();
-      ctx.arc(node.x + node.radius - 5, node.y - node.radius + 5, 8, 0, Math.PI * 2);
-      ctx.fillStyle = isDark ? '#fff' : '#000';
-      ctx.fill();
-      ctx.fillStyle = isDark ? '#000' : '#fff';
-      ctx.font = 'bold 10px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(String(node.connections), node.x + node.radius - 5, node.y - node.radius + 5);
-    }
-
-    // Draw label - dark text for light mode, light text for dark mode
-    if (showLabels) {
-      ctx.fillStyle = isDark ? '#fff' : '#000';
-      ctx.font = '12px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-
-      const lines = node.label.split('\n');
+    labels.each(function (d) {
+      const text = d3.select(this);
+      const lines = d.label.split('\n');
       lines.forEach((line, i) => {
-        ctx.fillText(line, node.x, node.y + node.radius + 5 + i * 14);
+        text
+          .append('tspan')
+          .attr('x', 0)
+          .attr('dy', i === 0 ? 0 : 14)
+          .text(line);
       });
 
       // Add pod count for grouped nodes
-      if (node.type === 'pod' && node.podCount && node.podCount > 1) {
-        ctx.fillStyle = isDark ? '#fff' : '#000';
-        ctx.font = '11px Arial';
-        ctx.fillText(`(${node.podCount} pods)`, node.x, node.y + node.radius + 5 + lines.length * 14);
+      if (d.type === 'pod' && d.podCount && d.podCount > 1) {
+        text
+          .append('tspan')
+          .attr('x', 0)
+          .attr('dy', 14)
+          .attr('font-size', 11)
+          .text(`(${d.podCount} pods)`);
       }
-    }
-  };
+    });
 
-  // Draw connection
-  const drawConnection = (ctx: CanvasRenderingContext2D, conn: Connection) => {
-    const fromX = conn.from.x;
-    const fromY = conn.from.y;
-    const toX = conn.to.x;
-    const toY = conn.to.y;
+    // Update positions on each tick
+    simulation.on('tick', () => {
+      // Update links as straight lines
+      link
+        .attr('x1', (d) => (d.source as Node).x!)
+        .attr('y1', (d) => (d.source as Node).y!)
+        .attr('x2', (d) => {
+          const sourceNode = d.source as Node;
+          const targetNode = d.target as Node;
+          const dx = targetNode.x! - sourceNode.x!;
+          const dy = targetNode.y! - sourceNode.y!;
+          const angle = Math.atan2(dy, dx);
+          const targetRadius = targetNode.type === 'pod' ? 30 : 25;
+          return targetNode.x! - Math.cos(angle) * targetRadius;
+        })
+        .attr('y2', (d) => {
+          const sourceNode = d.source as Node;
+          const targetNode = d.target as Node;
+          const dx = targetNode.x! - sourceNode.x!;
+          const dy = targetNode.y! - sourceNode.y!;
+          const angle = Math.atan2(dy, dx);
+          const targetRadius = targetNode.type === 'pod' ? 30 : 25;
+          return targetNode.y! - Math.sin(angle) * targetRadius;
+        });
 
-    const hasError = conn.errorCount > 0;
-    const isAccept = conn.eventType === 'accept';
-    const isDark = document.documentElement.classList.contains('dark');
+      linkLabels
+        .attr('x', (d) => {
+          const sourceNode = d.source as Node;
+          const targetNode = d.target as Node;
+          return (sourceNode.x! + targetNode.x!) / 2;
+        })
+        .attr('y', (d) => {
+          const sourceNode = d.source as Node;
+          const targetNode = d.target as Node;
+          return (sourceNode.y! + targetNode.y!) / 2;
+        });
 
-    // Different colors for accept vs connect flows
-    const flowColor = isAccept ? '#9C27B0' : '#4CAF50'; // Purple for accept, green for connect
+      node.attr('transform', (d) => `translate(${d.x},${d.y})`);
+    });
 
-    // Draw connection line
-    const gradient = ctx.createLinearGradient(fromX, fromY, toX, toY);
-
-    if (hasError && showErrorsOnly) {
-      // Highlight errors with bright red gradient
-      gradient.addColorStop(0, 'rgba(255, 82, 82, 0.6)');
-      gradient.addColorStop(1, 'rgba(255, 82, 82, 0.3)');
-      ctx.lineWidth = 3;
-    } else if (!hasError && showErrorsOnly) {
-      // Dim normal connections when highlighting errors
-      if (isDark) {
-        gradient.addColorStop(0, 'rgba(255, 255, 255, 0.1)');
-        gradient.addColorStop(1, 'rgba(255, 255, 255, 0.05)');
-      } else {
-        gradient.addColorStop(0, 'rgba(0, 0, 0, 0.1)');
-        gradient.addColorStop(1, 'rgba(0, 0, 0, 0.05)');
-      }
-      ctx.lineWidth = Math.max(1, Math.min(5, conn.count / 10));
-    } else {
-      // Normal gradient - dark lines for light mode, light lines for dark mode
-      if (isDark) {
-        gradient.addColorStop(0, 'rgba(255, 255, 255, 0.3)');
-        gradient.addColorStop(1, 'rgba(255, 255, 255, 0.1)');
-      } else {
-        gradient.addColorStop(0, 'rgba(0, 0, 0, 0.4)');
-        gradient.addColorStop(1, 'rgba(0, 0, 0, 0.2)');
-      }
-      ctx.lineWidth = Math.max(1, Math.min(5, conn.count / 10));
-    }
-
-    ctx.beginPath();
-    ctx.moveTo(fromX, fromY);
-    ctx.lineTo(toX, toY);
-    ctx.strokeStyle = gradient;
-    ctx.stroke();
-
-    // Draw bandwidth label at midpoint
-    if (showLabels) {
-      const midX = (fromX + toX) / 2;
-      const midY = (fromY + toY) / 2;
-
-      ctx.font = 'bold 11px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      const text = hasError
-        ? `${conn.count} flows (${conn.errorCount} errors)`
-        : `${conn.count} flows`;
-      const textWidth = ctx.measureText(text).width;
-
-      // Label background - light background for light mode, dark for dark mode
-      ctx.fillStyle = isDark ? 'rgba(0, 0, 0, 0.7)' : 'rgba(255, 255, 255, 0.9)';
-      ctx.fillRect(midX - textWidth / 2 - 4, midY - 8, textWidth + 8, 16);
-
-      // Label text - white for dark mode, dark for light mode
-      ctx.fillStyle = hasError ? '#ff5252' : (isDark ? '#fff' : '#000');
-      ctx.fillText(text, midX, midY);
-    }
-
-    // Draw particles with different colors for accept vs connect
-    if (!isPaused) {
-      conn.particles.forEach((particle) => {
-        const x = fromX + (toX - fromX) * particle.progress;
-        const y = fromY + (toY - fromY) * particle.progress;
-
-        ctx.beginPath();
-        ctx.arc(x, y, 3, 0, Math.PI * 2);
-        ctx.fillStyle = hasError ? '#ff5252' : flowColor;
-        ctx.fill();
-
-        // Update particle
-        particle.progress += particle.speed;
-        if (particle.progress > 1) {
-          particle.progress = 0;
-        }
+    // Setup zoom behavior
+    const zoomBehavior = d3
+      .zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.5, 2])
+      .on('zoom', (event) => {
+        container.attr('transform', event.transform);
+        setZoom(event.transform.k);
       });
-    }
-  };
+
+    zoomBehaviorRef.current = zoomBehavior;
+    svg.call(zoomBehavior);
+
+    return () => {
+      simulation.stop();
+    };
+  }, [nodes, links, showErrorsOnly]);
 
   // Zoom functions
   const handleZoomIn = () => {
-    setZoom((prev) => Math.min(prev + 0.2, 2.0));
+    if (svgRef.current && zoomBehaviorRef.current) {
+      d3.select(svgRef.current).transition().call(zoomBehaviorRef.current.scaleBy, 1.2);
+    }
   };
 
   const handleZoomOut = () => {
-    setZoom((prev) => Math.max(prev - 0.2, 0.5));
+    if (svgRef.current && zoomBehaviorRef.current) {
+      d3.select(svgRef.current).transition().call(zoomBehaviorRef.current.scaleBy, 0.8);
+    }
   };
 
   const handleZoomReset = () => {
-    setZoom(1.0);
-  };
-
-  // Reset layout - clear saved positions and recalculate node positions
-  const handleResetLayout = () => {
-    savedPositionsRef.current.clear();
-    localStorage.removeItem('tcpflow-node-positions');
-
-    // Recalculate positions for all existing nodes
-    const canvas = canvasRef.current;
-    if (!canvas || nodes.size === 0) return;
-
-    const newNodes = new Map(nodes);
-    const padding = 100;
-    const verticalSpacing = 80;
-
-    // Separate nodes by type
-    const podNodes = Array.from(newNodes.values()).filter(n => n.type === 'pod');
-    const serviceNodes = Array.from(newNodes.values()).filter(n => n.type === 'service');
-    const externalNodes = Array.from(newNodes.values()).filter(n => n.type === 'external');
-
-    // Reposition pods on the left
-    podNodes.forEach((node, index) => {
-      node.x = padding + 50;
-      node.y = padding + (index * verticalSpacing);
-    });
-
-    // Reposition services on the right
-    serviceNodes.forEach((node, index) => {
-      node.x = canvas.width - padding - 50;
-      node.y = padding + (index * verticalSpacing);
-    });
-
-    // Reposition external IPs
-    externalNodes.forEach((node, index) => {
-      node.x = canvas.width - padding - 150;
-      node.y = padding + (index * verticalSpacing);
-    });
-
-    setNodes(newNodes);
-  };
-
-  // Animation loop
-  const animate = () => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx) return;
-
-    // Clear canvas with gradient background (light or dark based on theme)
-    const isDark = document.documentElement.classList.contains('dark');
-    const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-    if (isDark) {
-      gradient.addColorStop(0, '#0f172a'); // slate-900
-      gradient.addColorStop(1, '#1e293b'); // slate-800
-    } else {
-      gradient.addColorStop(0, '#f1f5f9'); // slate-100
-      gradient.addColorStop(1, '#e2e8f0'); // slate-200
+    if (svgRef.current && zoomBehaviorRef.current) {
+      d3.select(svgRef.current).transition().call(zoomBehaviorRef.current.transform, d3.zoomIdentity);
     }
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Save context state
-    ctx.save();
-
-    // Apply pan transformation
-    ctx.translate(pan.x, pan.y);
-
-    // Apply zoom transformation from center of canvas
-    const centerX = canvas.width / 2;
-    const centerY = canvas.height / 2;
-    ctx.translate(centerX, centerY);
-    ctx.scale(zoom, zoom);
-    ctx.translate(-centerX, -centerY);
-
-    // Draw all connections (no filtering, just highlighting)
-    connections.forEach((conn) => {
-      drawConnection(ctx, conn);
-    });
-
-    // Draw nodes on top
-    nodes.forEach((node) => drawNode(ctx, node));
-
-    // Restore context state
-    ctx.restore();
-
-    animationFrameRef.current = requestAnimationFrame(animate);
-  };
-
-  // Convert screen coordinates to canvas coordinates accounting for zoom and pan
-  const screenToCanvas = (screenX: number, screenY: number, canvas: HTMLCanvasElement) => {
-    const centerX = canvas.width / 2;
-    const centerY = canvas.height / 2;
-
-    // Remove pan offset
-    const x1 = screenX - pan.x;
-    const y1 = screenY - pan.y;
-
-    // Remove zoom transformation
-    const x2 = (x1 - centerX) / zoom + centerX;
-    const y2 = (y1 - centerY) / zoom + centerY;
-
-    return { x: x2, y: y2 };
-  };
-
-  // Mouse event handlers for dragging nodes and panning
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    const { x: canvasX, y: canvasY } = screenToCanvas(screenX, screenY, canvas);
-
-    // Check if clicking on a node
-    for (const node of nodes.values()) {
-      const dx = canvasX - node.x;
-      const dy = canvasY - node.y;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-
-      if (distance < node.radius) {
-        setDraggedNode(node);
-        setDragOffset({ x: dx, y: dy });
-        canvas.style.cursor = 'grabbing';
-        return;
-      }
-    }
-
-    // If not clicking on a node, start panning
-    setIsPanning(true);
-    setPanStart({ x: screenX - pan.x, y: screenY - pan.y });
-    canvas.style.cursor = 'grabbing';
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-
-    if (draggedNode) {
-      // Update dragged node position
-      const { x: canvasX, y: canvasY } = screenToCanvas(screenX, screenY, canvas);
-      const newNodes = new Map(nodes);
-      const node = newNodes.get(draggedNode.id);
-      if (node) {
-        node.x = canvasX - dragOffset.x;
-        node.y = canvasY - dragOffset.y;
-        // Save position to localStorage
-        saveNodePosition(node.id, node.x, node.y);
-        setNodes(newNodes);
-      }
-    } else if (isPanning) {
-      // Update pan position
-      setPan({
-        x: screenX - panStart.x,
-        y: screenY - panStart.y,
-      });
-    } else {
-      // Check if hovering over a node to change cursor
-      const { x: canvasX, y: canvasY } = screenToCanvas(screenX, screenY, canvas);
-      let hovering = false;
-      for (const node of nodes.values()) {
-        const dx = canvasX - node.x;
-        const dy = canvasY - node.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        if (distance < node.radius) {
-          hovering = true;
-          break;
-        }
-      }
-      canvas.style.cursor = hovering ? 'grab' : 'default';
-    }
-  };
-
-  const handleMouseUp = () => {
-    const canvas = canvasRef.current;
-    if (canvas) {
-      canvas.style.cursor = 'default';
-    }
-    setDraggedNode(null);
-    setIsPanning(false);
-  };
-
-  const handleMouseLeave = () => {
-    setDraggedNode(null);
-    setIsPanning(false);
-  };
-
-  // Handle mouse wheel for zooming
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? -0.1 : 0.1;
-    setZoom((prev) => Math.max(0.5, Math.min(2.0, prev + delta)));
   };
 
   // Handle namespace filter toggle
@@ -798,41 +661,25 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
     return () => window.removeEventListener('keydown', handleEscape);
   }, [isFullscreen]);
 
-  // Setup canvas and start animation
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const parent = canvas.parentElement;
-    if (parent) {
-      canvas.width = parent.clientWidth;
-      canvas.height = isFullscreen ? window.innerHeight - 100 : 500;
-    }
-
-    animate();
-
-    return () => {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-      }
-    };
-  }, [nodes, connections, showLabels, isPaused, isFullscreen, zoom]);
-
   return (
-    <div className={isFullscreen ? 'fixed inset-0 z-[9999] bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-800' : 'relative bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-800 rounded-lg overflow-hidden h-full'}>
+    <div
+      className={
+        isFullscreen
+          ? 'fixed inset-0 z-[9999] bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-800'
+          : 'relative bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-800 rounded-lg overflow-hidden h-full'
+      }
+    >
       {/* Controls */}
       <div className="absolute top-3 left-3 z-10 flex gap-2 flex-wrap max-w-[calc(100%-180px)]">
         <button
-          onClick={() => setShowLabels(!showLabels)}
-          className="bg-slate-300 dark:bg-slate-700 hover:bg-slate-400 dark:hover:bg-slate-600 text-slate-900 dark:text-white px-3 py-1.5 rounded text-sm transition-colors"
+          onClick={() => setLiveUpdateEnabled(!liveUpdateEnabled)}
+          className={`px-3 py-1.5 rounded text-sm transition-colors ${
+            liveUpdateEnabled
+              ? 'bg-green-500/20 text-green-700 dark:text-green-400 hover:bg-green-500/30'
+              : 'bg-gray-500/20 text-gray-700 dark:text-gray-400 hover:bg-gray-500/30'
+          }`}
         >
-          {showLabels ? 'Hide Labels' : 'Show Labels'}
-        </button>
-        <button
-          onClick={() => setIsPaused(!isPaused)}
-          className="bg-slate-300 dark:bg-slate-700 hover:bg-slate-400 dark:hover:bg-slate-600 text-slate-900 dark:text-white px-3 py-1.5 rounded text-sm transition-colors"
-        >
-          {isPaused ? 'Resume' : 'Pause'}
+          {liveUpdateEnabled ? 'Live Updates On' : 'Live Updates Off'}
         </button>
         <button
           onClick={() => setShowErrorsOnly(!showErrorsOnly)}
@@ -853,13 +700,6 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
           }`}
         >
           {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
-        </button>
-        <button
-          onClick={handleResetLayout}
-          className="bg-purple-500/20 text-purple-700 dark:text-purple-400 hover:bg-purple-500/30 px-3 py-1.5 rounded text-sm transition-colors"
-          title="Reset node positions to default layout"
-        >
-          Reset Layout
         </button>
         <button
           onClick={handleZoomIn}
@@ -884,14 +724,16 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
         </button>
       </div>
 
-      <canvas
-        ref={canvasRef}
-        className="block w-full cursor-default"
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseLeave}
-        onWheel={handleWheel}
+      <svg
+        ref={svgRef}
+        className="block w-full"
+        style={{ height: isFullscreen ? window.innerHeight - 100 : 500 }}
+        onClick={(e) => {
+          // Close sidebar when clicking on SVG background (not on nodes)
+          if (e.target === svgRef.current) {
+            setSelectedNode(null);
+          }
+        }}
       />
 
       {/* Stats */}
@@ -910,7 +752,11 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
         </div>
         <div className="flex gap-1.5">
           <span className="text-slate-500 dark:text-slate-500">Errors:</span>
-          <span className={`font-bold ${stats.errors > 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'}`}>
+          <span
+            className={`font-bold ${
+              stats.errors > 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'
+            }`}
+          >
             {stats.errors}
           </span>
         </div>
@@ -920,18 +766,153 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       <div className="absolute top-3 right-3 bg-white/90 dark:bg-slate-800/90 backdrop-blur-sm px-4 py-3 rounded-lg text-xs text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700">
         <div className="font-bold mb-2 text-slate-900 dark:text-white">Legend</div>
         <div className="flex items-center gap-2 mb-1.5">
-          <div className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white" style={{ backgroundColor: nodeColors.pod }} />
+          <div
+            className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white"
+            style={{ backgroundColor: nodeColors.pod }}
+          />
           <span>Kubernetes Pod</span>
         </div>
         <div className="flex items-center gap-2 mb-1.5">
-          <div className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white" style={{ backgroundColor: nodeColors.service }} />
+          <div
+            className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white"
+            style={{ backgroundColor: nodeColors.service }}
+          />
           <span>Internal Service</span>
         </div>
         <div className="flex items-center gap-2">
-          <div className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white" style={{ backgroundColor: nodeColors.external }} />
+          <div
+            className="w-4 h-4 rounded-full border-2 border-slate-900 dark:border-white"
+            style={{ backgroundColor: nodeColors.external }}
+          />
           <span>External IP</span>
         </div>
       </div>
+
+      {/* Node Details Sidebar */}
+      {selectedNode && (
+        <div className="absolute top-[180px] right-3 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm px-4 py-3 rounded-lg text-xs text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 max-w-[320px] max-h-[calc(100vh-200px)] overflow-y-auto shadow-lg">
+          {/* Header */}
+          <div className="flex justify-between items-start mb-3 pb-2 border-b border-slate-300 dark:border-slate-600">
+            <div className="flex-1">
+              <div className="font-bold text-sm text-slate-900 dark:text-white mb-1">Node Details</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400">Click outside to close</div>
+            </div>
+            <button
+              onClick={() => setSelectedNode(null)}
+              className="text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 transition-colors"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* Node Info */}
+          <div className="mb-3">
+            <div className="flex items-center gap-2 mb-2">
+              <div
+                className="w-3 h-3 rounded-full border border-slate-900 dark:border-white"
+                style={{ backgroundColor: nodeColors[selectedNode.type] }}
+              />
+              <span className="font-semibold text-slate-900 dark:text-white capitalize">{selectedNode.type}</span>
+            </div>
+            <div className="space-y-1">
+              <div>
+                <span className="text-slate-500 dark:text-slate-400">Name: </span>
+                <span className="font-medium break-all">{selectedNode.label.split('\n')[0]}</span>
+              </div>
+              {selectedNode.namespace && (
+                <div>
+                  <span className="text-slate-500 dark:text-slate-400">Namespace: </span>
+                  <span className="font-medium">{selectedNode.namespace}</span>
+                </div>
+              )}
+              {selectedNode.podCount && selectedNode.podCount > 1 && (
+                <div>
+                  <span className="text-slate-500 dark:text-slate-400">Pods: </span>
+                  <span className="font-medium">{selectedNode.podCount}</span>
+                </div>
+              )}
+              <div>
+                <span className="text-slate-500 dark:text-slate-400">Total Connections: </span>
+                <span className="font-medium">{selectedNode.connections}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Outgoing Connections */}
+          {(() => {
+            const outgoing = Array.from(links.values()).filter((link) => link.source.id === selectedNode.id);
+            return outgoing.length > 0 ? (
+              <div className="mb-3">
+                <div className="font-semibold text-slate-900 dark:text-white mb-2 flex items-center gap-1">
+                  <span className="text-green-600 dark:text-green-400">→</span>
+                  Outgoing ({outgoing.length})
+                </div>
+                <div className="space-y-2">
+                  {outgoing.map((link, idx) => (
+                    <div key={idx} className="bg-slate-100 dark:bg-slate-700/50 p-2 rounded text-[11px]">
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <div
+                          className="w-2 h-2 rounded-full border border-slate-600 dark:border-slate-400 flex-shrink-0"
+                          style={{ backgroundColor: nodeColors[link.target.type] }}
+                        />
+                        <div className="font-medium break-all">{link.target.label.split('\n')[0]}</div>
+                      </div>
+                      {link.target.namespace && (
+                        <div className="text-slate-500 dark:text-slate-400 mb-1">
+                          <span className="text-[10px]">ns: </span>
+                          {link.target.namespace}
+                        </div>
+                      )}
+                      <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                        <span>{link.count} flows</span>
+                        {link.errorCount > 0 && <span className="text-red-600 dark:text-red-400">{link.errorCount} errors</span>}
+                      </div>
+                      <div className="text-slate-500 dark:text-slate-500 capitalize text-[10px]">{link.eventType}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null;
+          })()}
+
+          {/* Incoming Connections */}
+          {(() => {
+            const incoming = Array.from(links.values()).filter((link) => link.target.id === selectedNode.id);
+            return incoming.length > 0 ? (
+              <div>
+                <div className="font-semibold text-slate-900 dark:text-white mb-2 flex items-center gap-1">
+                  <span className="text-purple-600 dark:text-purple-400">←</span>
+                  Incoming ({incoming.length})
+                </div>
+                <div className="space-y-2">
+                  {incoming.map((link, idx) => (
+                    <div key={idx} className="bg-slate-100 dark:bg-slate-700/50 p-2 rounded text-[11px]">
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <div
+                          className="w-2 h-2 rounded-full border border-slate-600 dark:border-slate-400 flex-shrink-0"
+                          style={{ backgroundColor: nodeColors[link.source.type] }}
+                        />
+                        <div className="font-medium break-all">{link.source.label.split('\n')[0]}</div>
+                      </div>
+                      {link.source.namespace && (
+                        <div className="text-slate-500 dark:text-slate-400 mb-1">
+                          <span className="text-[10px]">ns: </span>
+                          {link.source.namespace}
+                        </div>
+                      )}
+                      <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                        <span>{link.count} flows</span>
+                        {link.errorCount > 0 && <span className="text-red-600 dark:text-red-400">{link.errorCount} errors</span>}
+                      </div>
+                      <div className="text-slate-500 dark:text-slate-500 capitalize text-[10px]">{link.eventType}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null;
+          })()}
+        </div>
+      )}
 
       {/* Namespace Filter */}
       {availableNamespaces.size > 0 && (
@@ -960,12 +941,7 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
                       : 'bg-slate-300 dark:bg-slate-700/50 hover:bg-slate-400 dark:hover:bg-slate-700'
                   }`}
                 >
-                  <input
-                    type="checkbox"
-                    checked={selectedNamespaces.has(ns)}
-                    onChange={() => {}}
-                    className="cursor-pointer"
-                  />
+                  <input type="checkbox" checked={selectedNamespaces.has(ns)} onChange={() => {}} className="cursor-pointer" />
                   <span>{ns}</span>
                 </div>
               ))}
