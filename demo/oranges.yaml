@@ -2,42 +2,61 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: oranges
-  namespace: demo
 spec:
+  progressDeadlineSeconds: 600
   replicas: 2
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: oranges
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
   template:
     metadata:
+      creationTimestamp: null
       labels:
         app: oranges
     spec:
       containers:
-      - name: oranges
-        image: demo-service:latest
-        imagePullPolicy: Never
+      - args:
+        - |
+          apt-get update && apt-get install -y curl && \
+          pip install flask requests && \
+          python /app/main.py
+        command:
+        - /bin/sh
+        - -c
         env:
-        - name: SERVICE_NAME
-          value: "oranges"
-        - name: TARGETS
-          value: "bananas:8080"
-        - name: INTERVALS
-          value: "60"  # Call bananas every 60s
-        ports:
-        - containerPort: 8080
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
+        - name: APP_NAME
+          value: oranges
+        image: python:3.9-slim
+        imagePullPolicy: IfNotPresent
+        name: main
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /app
+          name: app-code
+        - mountPath: /etc/config
+          name: app-config
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: shared-app-code
+        name: app-code
+      - configMap:
+          defaultMode: 420
+          name: oranges-config
+        name: app-config
 ---
 apiVersion: v1
 kind: Service

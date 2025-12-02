@@ -332,9 +332,9 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
           .distance(150)
           .strength(0.5)
       )
-      .force('charge', d3.forceManyBody().strength(-1000))
-      .force('x', d3.forceX(width / 2).strength(0.03))
-      .force('y', d3.forceY(height / 2).strength(0.03))
+      .force('charge', d3.forceManyBody().strength(-800))
+      .force('x', d3.forceX(width / 2).strength(0.06))
+      .force('y', d3.forceY(height / 2).strength(0.06))
       .force('collide', d3.forceCollide().radius(60).strength(0.8));
 
     simulationRef.current = simulation;
@@ -374,13 +374,12 @@ export const TCPFlowDiagram: React.FC<Props> = ({ outputs }) => {
       .selectAll('text')
       .data(linksArray)
       .join('text')
-      .attr('font-size', 11)
-      .attr('font-weight', 'bold')
+      .attr('font-size', 9)      
       .attr('text-anchor', 'middle')
       .attr('fill', (d) => (d.errorCount > 0 ? '#ff5252' : isDark ? '#fff' : '#000'))
       .attr('opacity', 0.8)
       .attr('class', 'link-label')
-      .text((d) => (d.errorCount > 0 ? `${d.count} flows (${d.errorCount} errors)` : `${d.count} flows`));
+      .text((d) => (d.errorCount > 0 ? `${d.count} c (${d.errorCount} err)` : `${d.count} c`));
 
     // Create nodes
     const node = container
