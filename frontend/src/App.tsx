@@ -366,7 +366,7 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-green-500"></div>
-            v0.4.2
+            v0.4.4
           </div>
         </div>
       </div>
